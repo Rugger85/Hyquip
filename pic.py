@@ -15,10 +15,20 @@ st.set_page_config(page_title="GPS Photo Tagger", layout="centered")
 def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     pil_font_dir = Path(PIL.__file__).resolve().parent / "fonts"
     windows_font_dir = Path("C:/Windows/Fonts")
+    linux_font_dirs = (
+        Path("/usr/share/fonts/truetype/dejavu"),
+        Path("/usr/share/fonts/truetype/liberation2"),
+        Path("/usr/share/fonts/truetype/liberation"),
+        Path("/usr/share/fonts/opentype/noto"),
+    )
     font_paths = (
         (
             windows_font_dir / "arialbd.ttf",
             pil_font_dir / "DejaVuSans-Bold.ttf",
+            linux_font_dirs[0] / "DejaVuSans-Bold.ttf",
+            linux_font_dirs[1] / "LiberationSans-Bold.ttf",
+            linux_font_dirs[2] / "LiberationSans-Bold.ttf",
+            linux_font_dirs[3] / "NotoSans-Bold.ttf",
             "arialbd.ttf",
             "DejaVuSans-Bold.ttf",
         )
@@ -26,6 +36,10 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFo
         else (
             windows_font_dir / "arial.ttf",
             pil_font_dir / "DejaVuSans.ttf",
+            linux_font_dirs[0] / "DejaVuSans.ttf",
+            linux_font_dirs[1] / "LiberationSans-Regular.ttf",
+            linux_font_dirs[2] / "LiberationSans-Regular.ttf",
+            linux_font_dirs[3] / "NotoSans-Regular.ttf",
             "arial.ttf",
             "DejaVuSans.ttf",
         )
@@ -35,7 +49,10 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFo
             return ImageFont.truetype(font_name, size)
         except (OSError, TypeError):
             continue
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
