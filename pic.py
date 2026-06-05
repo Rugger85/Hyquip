@@ -1,8 +1,10 @@
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from textwrap import shorten
 from urllib.parse import quote_plus
 
+import PIL
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
@@ -11,13 +13,27 @@ st.set_page_config(page_title="GPS Photo Tagger", layout="centered")
 
 
 def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    font_names = (
-        ("arialbd.ttf", "DejaVuSans-Bold.ttf") if bold else ("arial.ttf", "DejaVuSans.ttf")
+    pil_font_dir = Path(PIL.__file__).resolve().parent / "fonts"
+    windows_font_dir = Path("C:/Windows/Fonts")
+    font_paths = (
+        (
+            windows_font_dir / "arialbd.ttf",
+            pil_font_dir / "DejaVuSans-Bold.ttf",
+            "arialbd.ttf",
+            "DejaVuSans-Bold.ttf",
+        )
+        if bold
+        else (
+            windows_font_dir / "arial.ttf",
+            pil_font_dir / "DejaVuSans.ttf",
+            "arial.ttf",
+            "DejaVuSans.ttf",
+        )
     )
-    for font_name in font_names:
+    for font_name in font_paths:
         try:
             return ImageFont.truetype(font_name, size)
-        except OSError:
+        except (OSError, TypeError):
             continue
     return ImageFont.load_default()
 
@@ -56,6 +72,14 @@ def wrap_text(
         kept[-1] = shorten(kept[-1], width=max(12, len(kept[-1]) - 3), placeholder="...")
         return kept
     return lines
+
+
+def fit_font(draw: ImageDraw.ImageDraw, text: str, size: int, min_size: int, max_width: int, bold: bool = False) -> ImageFont.ImageFont:
+    for font_size in range(size, min_size - 1, -2):
+        font = load_font(font_size, bold=bold)
+        if text_width(draw, text, font) <= max_width:
+            return font
+    return load_font(min_size, bold=bold)
 
 
 def google_maps_link(latitude: str, longitude: str) -> str:
@@ -126,16 +150,17 @@ def draw_gps_tag(
     overlay = Image.new("RGBA", output.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
 
-    base = max(14, output.width // 54)
-    title_font = load_font(max(24, base + 10), bold=True)
-    body_font = load_font(max(18, base + 2), bold=True)
-    small_font = load_font(max(14, base - 2), bold=True)
-    tiny_font = load_font(max(11, base - 5), bold=True)
+    base = max(18, output.width // 34)
+    title_size = max(34, base + 20)
+    title_font = load_font(title_size, bold=True)
+    body_font = load_font(max(22, base + 2), bold=True)
+    small_font = load_font(max(18, base - 2), bold=True)
+    tiny_font = load_font(max(14, base - 7), bold=True)
 
     margin = max(18, output.width // 26)
     tag_x = margin
     tag_w = output.width - (margin * 2)
-    tag_h = max(int(output.height * 0.17), 150)
+    tag_h = max(int(output.height * 0.23), 190)
     tag_y = output.height - tag_h - margin
     padding = max(14, output.width // 75)
 
@@ -159,21 +184,30 @@ def draw_gps_tag(
         )
 
     text_x = tag_x + padding + tile_w + tile_gap
-    text_y = tag_y + padding + 6
+    text_y = tag_y + padding + 2
     text_w = tag_w - (text_x - tag_x) - padding
 
     badge = "GPS Map Camera"
     badge_w = text_width(draw, badge, tiny_font) + 44
     badge_x = tag_x + tag_w - badge_w - padding
-    badge_y = tag_y + 8
+    badge_y = tag_y + tag_h - padding - 28
     draw.rounded_rectangle((badge_x, badge_y, badge_x + badge_w, badge_y + 28), radius=4, fill=(35, 35, 35, 220))
     draw_pin(draw, badge_x + 18, badge_y + 13, 18)
     draw.text((badge_x + 32, badge_y + 6), badge, font=tiny_font, fill=(255, 255, 255, 255))
 
     if location_title:
-        for line in wrap_text(draw, location_title, title_font, max(80, text_w - badge_w), max_lines=1):
+        title_width = max(120, text_w)
+        title_font = fit_font(
+            draw,
+            location_title,
+            size=title_size,
+            min_size=max(body_font.size + 4, 28),
+            max_width=title_width,
+            bold=True,
+        )
+        for line in wrap_text(draw, location_title, title_font, title_width, max_lines=1):
             draw.text((text_x, text_y), line, font=title_font, fill=(255, 255, 255, 255))
-            text_y += title_font.size + 4
+            text_y += title_font.size + 8
 
     if address:
         for line in wrap_text(draw, address, body_font, text_w, max_lines=2):
