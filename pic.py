@@ -1,15 +1,20 @@
+from datetime import datetime
 from io import BytesIO
+from textwrap import shorten
+from urllib.parse import quote_plus
 
 import streamlit as st
-from PIL import Image, ImageColor, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 
-st.set_page_config(page_title="Photo Text Stamp", layout="centered")
+st.set_page_config(page_title="GPS Photo Tagger", layout="centered")
 
 
-def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """Use a common bundled font when available, otherwise fall back safely."""
-    for font_name in ("arial.ttf", "DejaVuSans.ttf"):
+def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    font_names = (
+        ("arialbd.ttf", "DejaVuSans-Bold.ttf") if bold else ("arial.ttf", "DejaVuSans.ttf")
+    )
+    for font_name in font_names:
         try:
             return ImageFont.truetype(font_name, size)
         except OSError:
@@ -17,7 +22,18 @@ def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
+def text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
+    box = draw.textbbox((0, 0), text, font=font)
+    return box[2] - box[0]
+
+
+def wrap_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+    max_lines: int | None = None,
+) -> list[str]:
     lines = []
     for original_line in text.splitlines():
         words = original_line.split()
@@ -28,113 +44,246 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, m
         line = words[0]
         for word in words[1:]:
             candidate = f"{line} {word}"
-            if draw.textbbox((0, 0), candidate, font=font)[2] <= max_width:
+            if text_width(draw, candidate, font) <= max_width:
                 line = candidate
             else:
                 lines.append(line)
                 line = word
         lines.append(line)
+
+    if max_lines and len(lines) > max_lines:
+        kept = lines[:max_lines]
+        kept[-1] = shorten(kept[-1], width=max(12, len(kept[-1]) - 3), placeholder="...")
+        return kept
     return lines
 
 
-def stamp_image(
+def google_maps_link(latitude: str, longitude: str) -> str:
+    query = quote_plus(f"{latitude},{longitude}")
+    return f"https://www.google.com/maps/search/?api=1&query={query}"
+
+
+def draw_pin(draw: ImageDraw.ImageDraw, cx: int, cy: int, size: int) -> None:
+    radius = size // 3
+    draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=(255, 56, 70, 255))
+    draw.polygon(
+        [
+            (cx - radius + 5, cy + radius // 3),
+            (cx + radius - 5, cy + radius // 3),
+            (cx, cy + size // 2),
+        ],
+        fill=(255, 56, 70, 255),
+    )
+    inner = max(4, radius // 3)
+    draw.ellipse((cx - inner, cy - inner, cx + inner, cy + inner), fill=(70, 18, 26, 255))
+
+
+def draw_map_tile(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    label_font: ImageFont.ImageFont,
+    small_font: ImageFont.ImageFont,
+) -> None:
+    draw.rounded_rectangle((x, y, x + width, y + height), radius=8, fill=(12, 18, 28, 255))
+    header_h = max(24, height // 5)
+    draw.rounded_rectangle((x, y, x + width, y + header_h), radius=8, fill=(22, 181, 60, 255))
+    draw.rectangle((x, y + header_h - 8, x + width, y + header_h), fill=(22, 181, 60, 255))
+
+    check_in = "Check In"
+    draw.text(
+        (x + (width - text_width(draw, check_in, small_font)) // 2, y + 4),
+        check_in,
+        font=small_font,
+        fill=(235, 255, 240, 255),
+    )
+
+    for i in range(4):
+        line_y = y + header_h + 12 + (i * height // 7)
+        draw.line((x + 12, line_y, x + width - 12, line_y + 10), fill=(25, 37, 56, 255), width=2)
+
+    draw_pin(draw, x + width // 2, y + height // 2 + 5, max(32, height // 3))
+    google = "Google"
+    draw.text((x + 14, y + height - 32), google, font=label_font, fill=(255, 255, 255, 255))
+
+
+def draw_gps_tag(
     image: Image.Image,
-    text: str,
-    position: str,
-    font_size: int,
-    text_color: str,
-    box_color: str,
-    box_opacity: int,
-    padding: int,
+    location_title: str,
+    address: str,
+    latitude: str,
+    longitude: str,
+    site_id: str,
+    timestamp_text: str,
+    extra_fields: str,
+    show_map_tile: bool,
+    include_map_link: bool,
+    map_url: str,
 ) -> Image.Image:
     output = image.convert("RGBA")
     overlay = Image.new("RGBA", output.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
-    font = load_font(font_size)
 
-    max_text_width = int(output.width * 0.9) - (padding * 2)
-    lines = wrap_text(draw, text, font, max_text_width)
-    line_boxes = [draw.textbbox((0, 0), line or " ", font=font) for line in lines]
-    line_height = max((box[3] - box[1] for box in line_boxes), default=font_size)
-    text_width = max((box[2] - box[0] for box in line_boxes), default=0)
-    text_height = (line_height * len(lines)) + (max(len(lines) - 1, 0) * 6)
+    base = max(14, output.width // 54)
+    title_font = load_font(max(24, base + 10), bold=True)
+    body_font = load_font(max(18, base + 2), bold=True)
+    small_font = load_font(max(14, base - 2), bold=True)
+    tiny_font = load_font(max(11, base - 5), bold=True)
 
-    box_width = text_width + (padding * 2)
-    box_height = text_height + (padding * 2)
-    margin = max(16, padding)
+    margin = max(18, output.width // 26)
+    tag_x = margin
+    tag_w = output.width - (margin * 2)
+    tag_h = max(int(output.height * 0.17), 150)
+    tag_y = output.height - tag_h - margin
+    padding = max(14, output.width // 75)
 
-    positions = {
-        "Top left": (margin, margin),
-        "Top right": (output.width - box_width - margin, margin),
-        "Bottom left": (margin, output.height - box_height - margin),
-        "Bottom right": (output.width - box_width - margin, output.height - box_height - margin),
-    }
-    x, y = positions[position]
+    draw.rounded_rectangle(
+        (tag_x, tag_y, tag_x + tag_w, tag_y + tag_h),
+        radius=8,
+        fill=(18, 18, 18, 190),
+    )
 
-    background_rgb = ImageColor.getrgb(box_color)
-    background = Image.new("RGBA", (box_width, box_height), (*background_rgb, box_opacity))
-    overlay.alpha_composite(background, (x, y))
+    tile_w = int(tag_w * 0.25) if show_map_tile else 0
+    tile_gap = padding if show_map_tile else 0
+    if show_map_tile:
+        draw_map_tile(
+            draw,
+            tag_x + padding,
+            tag_y + padding,
+            tile_w,
+            tag_h - (padding * 2),
+            label_font=body_font,
+            small_font=small_font,
+        )
 
-    text_x = x + padding
-    text_y = y + padding
-    for line in lines:
-        draw.text((text_x, text_y), line, fill=text_color, font=font)
-        text_y += line_height + 6
+    text_x = tag_x + padding + tile_w + tile_gap
+    text_y = tag_y + padding + 6
+    text_w = tag_w - (text_x - tag_x) - padding
+
+    badge = "GPS Map Camera"
+    badge_w = text_width(draw, badge, tiny_font) + 44
+    badge_x = tag_x + tag_w - badge_w - padding
+    badge_y = tag_y + 8
+    draw.rounded_rectangle((badge_x, badge_y, badge_x + badge_w, badge_y + 28), radius=4, fill=(35, 35, 35, 220))
+    draw_pin(draw, badge_x + 18, badge_y + 13, 18)
+    draw.text((badge_x + 32, badge_y + 6), badge, font=tiny_font, fill=(255, 255, 255, 255))
+
+    if location_title:
+        for line in wrap_text(draw, location_title, title_font, max(80, text_w - badge_w), max_lines=1):
+            draw.text((text_x, text_y), line, font=title_font, fill=(255, 255, 255, 255))
+            text_y += title_font.size + 4
+
+    if address:
+        for line in wrap_text(draw, address, body_font, text_w, max_lines=2):
+            draw.text((text_x, text_y), line, font=body_font, fill=(255, 255, 255, 240))
+            text_y += body_font.size + 2
+
+    detail_parts = []
+    if latitude:
+        detail_parts.append(f"Lat {latitude}")
+    if longitude:
+        detail_parts.append(f"Long {longitude}")
+    if site_id:
+        detail_parts.append(f"Site ID {site_id}")
+    if detail_parts:
+        draw.text((text_x, text_y), "  ".join(detail_parts), font=body_font, fill=(255, 255, 255, 255))
+        text_y += body_font.size + 3
+
+    if timestamp_text:
+        draw.text((text_x, text_y), timestamp_text, font=body_font, fill=(255, 255, 255, 255))
+        text_y += body_font.size + 3
+
+    if extra_fields:
+        for line in wrap_text(draw, extra_fields, small_font, text_w, max_lines=2):
+            draw.text((text_x, text_y), line, font=small_font, fill=(255, 255, 255, 235))
+            text_y += small_font.size + 2
+
+    if include_map_link and map_url:
+        link_text = shorten(map_url, width=70, placeholder="...")
+        draw.text((text_x, tag_y + tag_h - padding - small_font.size), link_text, font=small_font, fill=(180, 220, 255, 255))
 
     return Image.alpha_composite(output, overlay).convert("RGB")
 
 
-st.title("Photo Text Stamp")
-st.caption("Upload a picture, add site details, preview it, and download the stamped image.")
+st.title("GPS Photo Tagger")
+st.caption("Create a GPS Map Camera style tag with location, site details, map pin, preview, and download.")
 
 uploaded_file = st.file_uploader("Upload picture", type=["png", "jpg", "jpeg"])
 
-with st.form("details_form"):
-    site_id = st.text_input("Site ID")
-    latitude = st.text_input("Latitude")
-    longitude = st.text_input("Longitude")
-    extra_fields = st.text_area(
-        "Other fields",
-        placeholder="Example:\nEngineer: Ali\nDate: 2026-06-05\nStatus: Completed",
-        height=120,
-    )
+with st.form("tag_form"):
+    st.subheader("Location details")
+    location_title = st.text_input("Main location title", placeholder="Hub, Balochistan, Pakistan")
+    address = st.text_input("Address / area line", placeholder="Hub, Balochistan, Pakistan")
 
     col1, col2 = st.columns(2)
     with col1:
-        position = st.selectbox("Text position", ["Bottom left", "Bottom right", "Top left", "Top right"])
-        font_size = st.slider("Font size", 14, 72, 28)
+        latitude = st.text_input("Latitude", placeholder="25.229187")
     with col2:
-        text_color = st.color_picker("Text color", "#FFFFFF")
-        box_color = st.color_picker("Background color", "#000000")
+        longitude = st.text_input("Longitude", placeholder="67.034302")
 
-    box_opacity = st.slider("Background opacity", 0, 255, 150)
-    padding = st.slider("Text padding", 6, 40, 14)
+    site_id = st.text_input("Site ID", placeholder="33896")
+    extra_fields = st.text_area(
+        "Other fields",
+        placeholder="Example:\nEngineer: Ali\nStatus: Completed",
+        height=90,
+    )
+
+    st.subheader("Map link")
+    map_link_mode = st.radio(
+        "Google Maps link source",
+        ["Generate from latitude/longitude", "Use manual link"],
+        horizontal=True,
+    )
+    manual_map_url = st.text_input(
+        "Manual Google Maps link",
+        placeholder="Paste a Google Maps link here if the generated pin does not work",
+        disabled=map_link_mode == "Generate from latitude/longitude",
+    )
+
+    st.subheader("Tag style")
+    col3, col4 = st.columns(2)
+    with col3:
+        show_map_tile = st.checkbox("Show Google pin tile", value=True)
+        include_map_link = st.checkbox("Print map link on image", value=False)
+    with col4:
+        use_current_time = st.checkbox("Use current date/time", value=True)
+        picked_date = st.date_input("Date", value=datetime.now().date(), disabled=use_current_time)
+        picked_time = st.time_input("Time", value=datetime.now().time().replace(microsecond=0), disabled=use_current_time)
+
     submitted = st.form_submit_button("Create preview", type="primary")
 
 if uploaded_file and submitted:
     image = Image.open(uploaded_file)
-    details = []
-    if site_id:
-        details.append(f"Site ID: {site_id}")
-    if latitude:
-        details.append(f"Latitude: {latitude}")
-    if longitude:
-        details.append(f"Longitude: {longitude}")
-    if extra_fields:
-        details.append(extra_fields.strip())
+    generated_url = google_maps_link(latitude, longitude) if latitude and longitude else ""
+    map_url = manual_map_url.strip() if map_link_mode == "Use manual link" else generated_url
 
-    if not details:
-        st.warning("Please enter at least one field to place on the picture.")
+    if not location_title and not address and not latitude and not longitude and not site_id and not extra_fields:
+        st.warning("Please enter at least one detail for the GPS tag.")
+    elif map_link_mode == "Generate from latitude/longitude" and not generated_url:
+        st.warning("Please enter both latitude and longitude, or choose the manual link option.")
+    elif map_link_mode == "Use manual link" and not map_url:
+        st.warning("Please paste a manual Google Maps link, or switch back to generated link.")
     else:
-        stamped = stamp_image(
+        if use_current_time:
+            stamp_time = datetime.now()
+        else:
+            stamp_time = datetime.combine(picked_date, picked_time)
+        timestamp_text = stamp_time.strftime("%d/%m/%Y %I:%M %p GMT +05:00")
+
+        stamped = draw_gps_tag(
             image=image,
-            text="\n".join(details),
-            position=position,
-            font_size=font_size,
-            text_color=text_color,
-            box_color=box_color,
-            box_opacity=box_opacity,
-            padding=padding,
+            location_title=location_title.strip(),
+            address=address.strip(),
+            latitude=latitude.strip(),
+            longitude=longitude.strip(),
+            site_id=site_id.strip(),
+            timestamp_text=timestamp_text,
+            extra_fields=extra_fields.strip(),
+            show_map_tile=show_map_tile,
+            include_map_link=include_map_link,
+            map_url=map_url,
         )
 
         buffer = BytesIO()
@@ -143,10 +292,12 @@ if uploaded_file and submitted:
 
         st.subheader("Preview")
         st.image(stamped, use_container_width=True)
+        if map_url:
+            st.link_button("Open map pin", map_url)
         st.download_button(
-            "Download stamped picture",
+            "Download tagged picture",
             data=buffer,
-            file_name="stamped_picture.png",
+            file_name="gps_tagged_picture.png",
             mime="image/png",
         )
 elif not uploaded_file:
