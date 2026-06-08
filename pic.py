@@ -1,8 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from textwrap import shorten
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 
 import PIL
 import streamlit as st
@@ -10,6 +10,15 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 st.set_page_config(page_title="GPS Photo Tagger", layout="centered")
+
+try:
+    APP_TIMEZONE = ZoneInfo("Asia/Karachi")
+except Exception:
+    APP_TIMEZONE = timezone(timedelta(hours=5))
+
+
+def current_app_time() -> datetime:
+    return datetime.now(APP_TIMEZONE)
 
 
 def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -60,6 +69,26 @@ def text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) 
     return box[2] - box[0]
 
 
+def ellipsize_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> str:
+    if text_width(draw, text, font) <= max_width:
+        return text
+
+    placeholder = "..."
+    if text_width(draw, placeholder, font) > max_width:
+        return ""
+
+    low = 0
+    high = len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        candidate = f"{text[:mid]}{placeholder}"
+        if text_width(draw, candidate, font) <= max_width:
+            low = mid
+        else:
+            high = mid - 1
+    return f"{text[:low]}{placeholder}"
+
+
 def wrap_text(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -91,12 +120,59 @@ def wrap_text(
     return lines
 
 
+def wrap_unspaced_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+    max_lines: int,
+) -> list[str]:
+    lines = []
+    remaining = text
+    while remaining and len(lines) < max_lines:
+        low = 1
+        high = len(remaining)
+        fit_count = 0
+        while low <= high:
+            mid = (low + high) // 2
+            if text_width(draw, remaining[:mid], font) <= max_width:
+                fit_count = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        if fit_count <= 0:
+            break
+
+        if len(lines) == max_lines - 1 and fit_count < len(remaining):
+            lines.append(ellipsize_text(draw, remaining, font, max_width))
+            return lines
+
+        lines.append(remaining[:fit_count])
+        remaining = remaining[fit_count:]
+    return lines
+
+
 def fit_font(draw: ImageDraw.ImageDraw, text: str, size: int, min_size: int, max_width: int, bold: bool = False) -> ImageFont.ImageFont:
     for font_size in range(size, min_size - 1, -2):
         font = load_font(font_size, bold=bold)
         if text_width(draw, text, font) <= max_width:
             return font
     return load_font(min_size, bold=bold)
+
+
+def draw_text_if_fits(
+    draw: ImageDraw.ImageDraw,
+    position: tuple[int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    fill: tuple[int, int, int, int],
+    bottom_limit: int,
+) -> int:
+    if position[1] + font.size > bottom_limit:
+        return position[1]
+    draw.text(position, text, font=font, fill=fill)
+    return position[1] + font.size
 
 
 def google_maps_link(latitude: str, longitude: str) -> str:
@@ -147,7 +223,8 @@ def draw_map_tile(
 
     draw_pin(draw, x + width // 2, y + height // 2 + 5, max(32, height // 3))
     google = "Google"
-    draw.text((x + 14, y + height - 32), google, font=label_font, fill=(255, 255, 255, 255))
+    google_font = fit_font(draw, google, label_font.size, 14, width - 28, bold=True)
+    draw.text((x + 14, y + height - google_font.size - 8), google, font=google_font, fill=(255, 255, 255, 255))
 
 
 def draw_gps_tag(
@@ -173,11 +250,16 @@ def draw_gps_tag(
     body_font = load_font(max(22, base + 2), bold=True)
     small_font = load_font(max(18, base - 2), bold=True)
     tiny_font = load_font(max(14, base - 7), bold=True)
+    link_font = load_font(max(16, small_font.size - 5), bold=True)
+    link_line_h = link_font.size + 3
 
     margin = max(18, output.width // 26)
     tag_x = margin
     tag_w = output.width - (margin * 2)
-    tag_h = max(int(output.height * 0.23), 190)
+    link_enabled = include_map_link and bool(map_url)
+    tag_ratio = 0.42 if link_enabled else 0.23
+    tag_min_h = 330 if link_enabled else 190
+    tag_h = max(int(output.height * tag_ratio), tag_min_h)
     tag_y = output.height - tag_h - margin
     padding = max(14, output.width // 75)
 
@@ -207,10 +289,20 @@ def draw_gps_tag(
     badge = "GPS Map Camera"
     badge_w = text_width(draw, badge, tiny_font) + 44
     badge_x = tag_x + tag_w - badge_w - padding
-    badge_y = tag_y + tag_h - padding - 28
-    draw.rounded_rectangle((badge_x, badge_y, badge_x + badge_w, badge_y + 28), radius=4, fill=(35, 35, 35, 220))
-    draw_pin(draw, badge_x + 18, badge_y + 13, 18)
-    draw.text((badge_x + 32, badge_y + 6), badge, font=tiny_font, fill=(255, 255, 255, 255))
+    badge_h = max(28, tiny_font.size + 12)
+    link_h = (link_line_h * 3) + 6 if link_enabled else 0
+    footer_h = max(32, badge_h) + link_h
+    content_bottom = tag_y + tag_h - padding - footer_h
+    footer_y = tag_y + tag_h - padding - footer_h
+    badge_y = footer_y if link_enabled else footer_y + (footer_h - badge_h) // 2
+    draw.rounded_rectangle((badge_x, badge_y, badge_x + badge_w, badge_y + badge_h), radius=4, fill=(35, 35, 35, 220))
+    draw_pin(draw, badge_x + 18, badge_y + badge_h // 2, 18)
+    draw.text(
+        (badge_x + 32, badge_y + (badge_h - tiny_font.size) // 2 - 1),
+        badge,
+        font=tiny_font,
+        fill=(255, 255, 255, 255),
+    )
 
     if location_title:
         title_width = max(120, text_w)
@@ -223,13 +315,27 @@ def draw_gps_tag(
             bold=True,
         )
         for line in wrap_text(draw, location_title, title_font, title_width, max_lines=1):
-            draw.text((text_x, text_y), line, font=title_font, fill=(255, 255, 255, 255))
-            text_y += title_font.size + 8
+            text_y = draw_text_if_fits(
+                draw,
+                (text_x, text_y),
+                line,
+                title_font,
+                (255, 255, 255, 255),
+                content_bottom,
+            )
+            text_y += 8
 
     if address:
         for line in wrap_text(draw, address, body_font, text_w, max_lines=2):
-            draw.text((text_x, text_y), line, font=body_font, fill=(255, 255, 255, 240))
-            text_y += body_font.size + 2
+            text_y = draw_text_if_fits(
+                draw,
+                (text_x, text_y),
+                line,
+                body_font,
+                (255, 255, 255, 240),
+                content_bottom,
+            )
+            text_y += 2
 
     detail_parts = []
     if latitude:
@@ -239,21 +345,55 @@ def draw_gps_tag(
     if site_id:
         detail_parts.append(f"Site ID {site_id}")
     if detail_parts:
-        draw.text((text_x, text_y), "  ".join(detail_parts), font=body_font, fill=(255, 255, 255, 255))
-        text_y += body_font.size + 3
+        detail_text = ellipsize_text(draw, "  ".join(detail_parts), body_font, text_w)
+        text_y = draw_text_if_fits(
+            draw,
+            (text_x, text_y),
+            detail_text,
+            body_font,
+            (255, 255, 255, 255),
+            content_bottom,
+        )
+        text_y += 3
 
     if timestamp_text:
-        draw.text((text_x, text_y), timestamp_text, font=body_font, fill=(255, 255, 255, 255))
-        text_y += body_font.size + 3
+        timestamp_text = ellipsize_text(draw, timestamp_text, body_font, text_w)
+        text_y = draw_text_if_fits(
+            draw,
+            (text_x, text_y),
+            timestamp_text,
+            body_font,
+            (255, 255, 255, 255),
+            content_bottom,
+        )
+        text_y += 3
 
     if extra_fields:
         for line in wrap_text(draw, extra_fields, small_font, text_w, max_lines=2):
-            draw.text((text_x, text_y), line, font=small_font, fill=(255, 255, 255, 235))
-            text_y += small_font.size + 2
+            text_y = draw_text_if_fits(
+                draw,
+                (text_x, text_y),
+                line,
+                small_font,
+                (255, 255, 255, 235),
+                content_bottom,
+            )
+            text_y += 2
 
-    if include_map_link and map_url:
-        link_text = shorten(map_url, width=70, placeholder="...")
-        draw.text((text_x, tag_y + tag_h - padding - small_font.size), link_text, font=small_font, fill=(180, 220, 255, 255))
+    if link_enabled:
+        link_x = text_x
+        link_max_w = tag_x + tag_w - padding - link_x
+        if link_max_w >= 90:
+            link_lines = wrap_unspaced_text(draw, map_url, link_font, link_max_w, max_lines=3)
+            link_y = tag_y + tag_h - padding - (len(link_lines) * link_line_h)
+            for line in link_lines:
+                draw.text(
+                    (link_x, link_y),
+                    line,
+                    font=link_font,
+                    fill=(180, 220, 255, 255),
+                )
+                link_y += link_line_h
 
     return Image.alpha_composite(output, overlay).convert("RGB")
 
@@ -263,49 +403,60 @@ st.caption("Create a GPS Map Camera style tag with location, site details, map p
 
 uploaded_file = st.file_uploader("Upload picture", type=["png", "jpg", "jpeg"])
 
-with st.form("tag_form"):
-    st.subheader("Location details")
-    location_title = st.text_input("Main location title", placeholder="Hub, Balochistan, Pakistan")
-    address = st.text_input("Address / area line", placeholder="Hub, Balochistan, Pakistan")
+if "preview_requested" not in st.session_state:
+    st.session_state.preview_requested = False
+if "picked_date" not in st.session_state:
+    st.session_state.picked_date = current_app_time().date()
+if "picked_time" not in st.session_state:
+    st.session_state.picked_time = current_app_time().time().replace(microsecond=0)
+if "include_map_link" not in st.session_state:
+    st.session_state.include_map_link = False
 
-    col1, col2 = st.columns(2)
-    with col1:
-        latitude = st.text_input("Latitude", placeholder="25.229187")
-    with col2:
-        longitude = st.text_input("Longitude", placeholder="67.034302")
+st.subheader("Location details")
+location_title = st.text_input("Main location title", placeholder="Hub, Balochistan, Pakistan")
+address = st.text_input("Address / area line", placeholder="Hub, Balochistan, Pakistan")
 
-    site_id = st.text_input("Site ID", placeholder="33896")
-    extra_fields = st.text_area(
-        "Other fields",
-        placeholder="Example:\nEngineer: Ali\nStatus: Completed",
-        height=90,
-    )
+col1, col2 = st.columns(2)
+with col1:
+    latitude = st.text_input("Latitude", placeholder="25.229187")
+with col2:
+    longitude = st.text_input("Longitude", placeholder="67.034302")
 
-    st.subheader("Map link")
-    map_link_mode = st.radio(
-        "Google Maps link source",
-        ["Generate from latitude/longitude", "Use manual link"],
-        horizontal=True,
-    )
-    manual_map_url = st.text_input(
-        "Manual Google Maps link",
-        placeholder="Paste a Google Maps link here if the generated pin does not work",
-        disabled=map_link_mode == "Generate from latitude/longitude",
-    )
+site_id = st.text_input("Site ID", placeholder="33896")
+extra_fields = st.text_area(
+    "Other fields",
+    placeholder="Example:\nEngineer: Ali\nStatus: Completed",
+    height=90,
+)
 
-    st.subheader("Tag style")
-    col3, col4 = st.columns(2)
-    with col3:
-        show_map_tile = st.checkbox("Show Google pin tile", value=True)
-        include_map_link = st.checkbox("Print map link on image", value=False)
-    with col4:
-        use_current_time = st.checkbox("Use current date/time", value=True)
-        picked_date = st.date_input("Date", value=datetime.now().date(), disabled=use_current_time)
-        picked_time = st.time_input("Time", value=datetime.now().time().replace(microsecond=0), disabled=use_current_time)
+st.subheader("Map link")
+map_link_mode = st.radio(
+    "Google Maps link source",
+    ["Generate from latitude/longitude", "Use manual link"],
+    horizontal=True,
+)
+manual_map_url = st.text_input(
+    "Manual Google Maps link",
+    placeholder="Paste a Google Maps link here if the generated pin does not work",
+    disabled=map_link_mode == "Generate from latitude/longitude",
+)
+if map_link_mode == "Use manual link" and manual_map_url.strip():
+    st.session_state.include_map_link = True
 
-    submitted = st.form_submit_button("Create preview", type="primary")
+st.subheader("Tag style")
+col3, col4 = st.columns(2)
+with col3:
+    show_map_tile = st.checkbox("Show Google pin tile", value=True)
+    include_map_link = st.checkbox("Print map link on image", key="include_map_link")
+with col4:
+    use_current_time = st.checkbox("Use current date/time", value=True)
+    picked_date = st.date_input("Date", key="picked_date", disabled=use_current_time)
+    picked_time = st.time_input("Time", key="picked_time", disabled=use_current_time)
 
-if uploaded_file and submitted:
+if st.button("Create preview", type="primary"):
+    st.session_state.preview_requested = True
+
+if uploaded_file and st.session_state.preview_requested:
     image = Image.open(uploaded_file)
     generated_url = google_maps_link(latitude, longitude) if latitude and longitude else ""
     map_url = manual_map_url.strip() if map_link_mode == "Use manual link" else generated_url
@@ -318,9 +469,9 @@ if uploaded_file and submitted:
         st.warning("Please paste a manual Google Maps link, or switch back to generated link.")
     else:
         if use_current_time:
-            stamp_time = datetime.now()
+            stamp_time = current_app_time()
         else:
-            stamp_time = datetime.combine(picked_date, picked_time)
+            stamp_time = datetime.combine(picked_date, picked_time, tzinfo=APP_TIMEZONE)
         timestamp_text = stamp_time.strftime("%d/%m/%Y %I:%M %p GMT +05:00")
 
         stamped = draw_gps_tag(
